@@ -1,0 +1,2 @@
+FROM ubuntu:18.04
+RUN echo 'Hello, World its 2025!' > /test.txt
