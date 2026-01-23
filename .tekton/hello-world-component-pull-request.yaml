@@ -26,10 +26,11 @@ spec:
   - name: output-image
     value: quay.io/redhat-user-workloads-stage/rh-ee-sconroy-tenant/hello-world-component:on-pr-{{revision}}
   - name: image-expires-after
-    value: 5d
+    value: 52
   - name: build-platforms
     value:
     - linux/x86_64
+    - linux/arm64
   - name: dockerfile
     value: Containerfile
   pipelineSpec:
@@ -111,6 +112,7 @@ spec:
       type: string
     - default:
       - linux/x86_64
+      - linux/arm64
       description: List of platforms to build the container images on. The available
         set of values is determined by the configuration of the multi-platform-controller.
       name: build-platforms
