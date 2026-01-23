@@ -1,12 +1,12 @@
 FROM registry.access.redhat.com/ubi9/ubi:latest
 
-LABEL name="Hello World Dummy Image"
+LABEL name="Hello User Dummy Image"
 LABEL description="A simple dummy image for demonstration purposes"
 LABEL io.k8s.description="A simple dummy image for demonstration purposes"
-LABEL io.k8s.display-name="Hello World Dummy Image"
+LABEL io.k8s.display-name="Hello User Dummy Image"
 LABEL summary="A simple dummy image for demonstration purposes"
-LABEL com.redhat.component="hello-world-dummy-image"
+LABEL com.redhat.component="hello-user-dummy-image"
 LABEL maintainer="Sean Conroy"
 
-# Create a simple file to demonstrate the image functionality
-RUN echo "Hello, World!" > /hello.txt
+# Create a simple file that greets the user
+RUN echo "Hello, User!" > /hello.txt
