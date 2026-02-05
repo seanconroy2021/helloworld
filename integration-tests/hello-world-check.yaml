@@ -1,0 +1,98 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-world-check
+spec:
+  description: |
+    Integration test that verifies the hello-world container image contains
+    the correct /hello.txt file with "Hello, World!" content.
+  params:
+    - description: 'Snapshot of the application'
+      name: SNAPSHOT
+      type: string
+  tasks:
+    - name: verify-hello-file
+      description: Verify that /hello.txt exists and contains "Hello, World!"
+      params:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            description: The JSON string of the Snapshot under test
+        results:
+          - name: TEST_RESULT
+            description: JSON object with test result details
+        steps:
+          - name: check-hello-file
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              echo "Installing dependencies..."
+              dnf -y install jq skopeo tar >/dev/null
+
+              echo "Reading snapshot..."
+              componentImage=$(jq -r '.components[0].containerImage' <<< "${SNAPSHOT}")
+              componentName=$(jq -r '.components[0].name' <<< "${SNAPSHOT}")
+
+              echo "Component: ${componentName}"
+              echo "Image: ${componentImage}"
+
+              RESULT="FAILURE"
+              SUCCESSES=0
+              FAILURES=0
+
+              TMP_IMG=$(mktemp -d)
+              ROOTFS=$(mktemp -d)
+
+              skopeo copy --override-arch amd64 "docker://${componentImage}" "dir:${TMP_IMG}"
+
+              MANIFEST="${TMP_IMG}/manifest.json"
+
+              if [[ ! -f "$MANIFEST" ]]; then
+                echo "ERROR: manifest.json not found"
+                FAILURES=1
+              else
+                jq -r '.layers[].digest' "$MANIFEST" | while read -r digest; do
+                  layer="${TMP_IMG}/blobs/${digest/:/\/}"
+                  if [[ -f "$layer" ]]; then
+                    tar -xf "$layer" -C "$ROOTFS" 2>/dev/null || true
+                  fi
+                done
+                echo "Validating /hello.txt..."
+                if [[ -f "$ROOTFS/hello.txt" ]]; then
+                  CONTENT=$(cat "$ROOTFS/hello.txt")
+                  if [[ "$CONTENT" == "Hello, World!" ]]; then
+                    echo "SUCCESS: File contains correct content"
+                    RESULT="SUCCESS"
+                    SUCCESSES=1
+                  else
+                    echo "FAILURE: Found '$CONTENT'"
+                    FAILURES=1
+                  fi
+                else
+                  echo "FAILURE: /hello.txt missing"
+                  FAILURES=1
+                fi
+              fi
+
+              TEST_OUTPUT=$(jq -rc \
+                --arg date "$(date -u --iso-8601=seconds)" \
+                --arg result "$RESULT" \
+                --argjson successes "$SUCCESSES" \
+                --argjson failures "$FAILURES" \
+                --null-input \
+                '{result: $result, timestamp: $date, successes: $successes, failures: $failures, warnings: 0}')
+
+              echo -n "$TEST_OUTPUT" | tee "$(results.TEST_RESULT.path)"
+              if [[ "$RESULT" == "FAILURE" ]]; then
+                exit 1
+              fi
+
+              echo "Test completed successfully."
