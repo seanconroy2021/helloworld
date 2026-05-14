@@ -1,0 +1,16 @@
+---
+name: Lint
+on:
+  pull_request:
+    branches: [hello-kind]
+  push:
+    branches: [hello-kind]
+
+jobs:
+  check-renovate-config-file:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+      - uses: konflux-ci/renovate-config-validator-action@078d8d5e483879bcb260de0f717be30b59df010c  # main
+        with:
+          config_file: .github/renovate.json
