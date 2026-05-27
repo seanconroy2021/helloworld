@@ -11,6 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
-      - uses: konflux-ci/renovate-config-validator-action@078d8d5e483879bcb260de0f717be30b59df010c  # main
+      - uses: konflux-ci/renovate-config-validator-action@adca50c2ce7ba1f3fab4d15f8783ad239f8090ae  # main
         with:
           config_file: .github/renovate.json
