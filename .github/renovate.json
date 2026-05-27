@@ -1,16 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "rebaseWhen": "behind-base-branch",
-  "tekton": {
-    "schedule": ["at any time"],
-    "includePaths": [
-      ".tekton/**",
-      "integration-tests/**",
-      "tasks/**",
-      "pipelines/**"
-    ]
-  },
-  "github-actions": {
-    "schedule": ["at any time"]
-  }
+  "extends": ["github>seanconroy2021/release-service-automations//MintMaker/default"]
 }
