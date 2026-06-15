@@ -1,4 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>seanconroy2021/release-service-automations//MintMaker/default"]
+  "extends": ["github>konflux-ci/release-service-automations//MintMaker/default"]
 }
