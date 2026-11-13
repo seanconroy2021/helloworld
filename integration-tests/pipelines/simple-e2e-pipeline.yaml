@@ -1,0 +1,520 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: simple-e2e-pipeline
+spec:
+  description: |-
+    This pipeline creates two kind clusters to run the test described in the README.md. It will install
+    tekton on each then create a simple InternalRequest to ensure that the status is updated successfully.
+  params:
+    - name: SNAPSHOT
+      description: 'The JSON string representing the snapshot of the application under test.'
+      default: '{"components": [{"name":"test-app", "containerImage": "quay.io/example/repo:latest"}]}'
+      type: string
+    - name: test-name
+      description: 'The name of the test corresponding to a defined Konflux integration test.'
+      default: ''
+      type: string
+    - name: ocp-version
+      description: 'The OpenShift version to use for the ephemeral cluster deployment.'
+      type: string
+    - name: test-event-type
+      description: 'Indicates if the test is triggered by a Pull Request or Push event.'
+      default: 'none'
+    - name: konflux-test-infra-secret
+      description: The name of the secret where testing infrastructure credentials are stored.
+      type: string
+    - name: cloud-credential-key
+      description: The key within the konflux-test-infra secret where AWS ROSA configuration details are stored.
+      type: string
+    - name: replicas
+      description: 'The number of replicas for the cluster nodes.'
+      type: string
+    - name: machine-type
+      description: 'The type of machine to use for the cluster nodes.'
+      type: string
+    - name: oci-container-repo
+      default: 'quay.io/konflux-test-storage/konflux-team/internal-services'
+      description: The ORAS container used to store all test artifacts.
+    - name: artifact-browser-url
+      description: "URL to the artifact browser deployment. If provided, a link will be added to PR comments."
+      default: ""
+      type: string
+  tasks:
+    - name: test-metadata
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog.git
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/test-metadata/0.4/test-metadata.yaml
+      params:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+        - name: test-name
+          value: $(context.pipelineRun.name)
+    - name: check-if-test-relevant
+      runAfter:
+        - test-metadata
+      params:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+        - name: git-repo
+          value: "$(tasks.test-metadata.results.git-repo)"
+        - name: git-org
+          value: "$(tasks.test-metadata.results.git-org)"
+        - name: git-revision
+          value: "$(tasks.test-metadata.results.git-revision)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+          - name: git-repo
+            type: string
+          - name: git-org
+            type: string
+          - name: git-revision
+            type: string
+        results:
+          - name: testRelevant
+            type: string
+        steps:
+          - name: check-if-test-relevant
+            image: quay.io/konflux-ci/release-service-utils@sha256:14cc7c9550cf0cecf0ba675e6ac827994f183391b94cba5a1c9a63dce5ef4f67
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+              - name: REPO
+                value: $(params.git-repo)
+              - name: ORG
+                value: $(params.git-org)
+              - name: REVISION
+                value: $(params.git-revision)
+            script: |
+              #!/usr/bin/env bash
+              set -ex
+
+              echo -n "false" > $(results.testRelevant.path)
+
+              if [ $(jq '.components | length'  <<< "${SNAPSHOT}") -ne 1 ] ; then
+                  echo "Error: snapshot components array not of length 1"
+                  exit 1
+              fi
+
+              curl -s "https://api.github.com/repos/${ORG}/${REPO}/commits/${REVISION}" | \
+                jq -r '.files[] | "\(.status) \(.filename)"' | \
+                while read status filename; do
+                    # Skip deleted files
+                    if [[ "$status" == "deleted" ]]; then
+                        continue
+                    fi
+
+                    # Check if file has .md suffix or is in .github directory
+                    if [[ "$filename" != *.md ]] && [[ "$filename" != .github/* ]]; then
+                        echo -n "true" > $(results.testRelevant.path)
+                        exit 0 # No need to check the rest
+                    fi
+                done
+    - name: provision-remote-kind-cluster
+      runAfter:
+        - check-if-test-relevant
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/mapt-oci/kind-aws-spot/provision/0.2/kind-aws-provision.yaml
+      params:
+        - name: secret-aws-credentials
+          value: mapt-kind-secret
+        - name: cluster-access-secret-name
+          value: kfg-$(context.pipelineRun.name)-remote
+        - name: id
+          value: $(context.pipelineRun.name)-remote
+        - name: tags
+          value: env=konflux,user=internal-services
+        - name: debug
+          value: 'false'
+        - name: ownerKind
+          value: PipelineRun
+        - name: ownerName
+          value: $(context.pipelineRun.name)
+        - name: ownerUid
+          value: $(context.pipelineRun.uid)
+        - name: oci-ref
+          value: $(params.oci-container-repo):$(context.pipelineRun.name)-remote
+        - name: credentials-secret-name
+          value: $(params.konflux-test-infra-secret)
+        - name: spot
+          value: "false"
+        - name: compute-sizes
+          value: "t3a.2xlarge,m5a.2xlarge,m5ad.2xlarge,m6a.2xlarge,m7a.2xlarge,m8a.2xlarge"
+    - name: provision-local-kind-cluster
+      runAfter:
+        - check-if-test-relevant
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/mapt-oci/kind-aws-spot/provision/0.2/kind-aws-provision.yaml
+      params:
+        - name: secret-aws-credentials
+          value: mapt-kind-secret
+        - name: cluster-access-secret-name
+          value: kfg-$(context.pipelineRun.name)-local
+        - name: id
+          value: $(context.pipelineRun.name)-local
+        - name: tags
+          value: env=konflux,user=internal-services
+        - name: debug
+          value: 'false'
+        - name: ownerKind
+          value: PipelineRun
+        - name: ownerName
+          value: $(context.pipelineRun.name)
+        - name: ownerUid
+          value: $(context.pipelineRun.uid)
+        - name: oci-ref
+          value: $(params.oci-container-repo):$(context.pipelineRun.name)-local
+        - name: credentials-secret-name
+          value: $(params.konflux-test-infra-secret)
+        - name: spot
+          value: "false"
+        - name: compute-sizes
+          value: "t3a.2xlarge,m5a.2xlarge,m5ad.2xlarge,m6a.2xlarge,m7a.2xlarge,m8a.2xlarge"
+    - name: run-e2e
+      runAfter:
+        - provision-local-kind-cluster
+        - provision-remote-kind-cluster
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      params:
+        - name: git-repo
+          value: "$(tasks.test-metadata.results.source-repo-url)"
+        - name: git-revision
+          value: "$(tasks.test-metadata.results.git-revision)"
+        - name: git-org
+          value: "$(tasks.test-metadata.results.git-org)"
+        - name: git-repo-name
+          value: "$(tasks.test-metadata.results.git-repo)"
+        - name: remote-cluster-access-secret
+          value: kfg-$(context.pipelineRun.name)-remote
+        - name: local-cluster-access-secret
+          value: kfg-$(context.pipelineRun.name)-local
+      taskSpec:
+        params:
+          - name: git-repo
+            type: string
+          - name: git-revision
+            type: string
+          - name: git-org
+            type: string
+          - name: git-repo-name
+            type: string
+          - name: remote-cluster-access-secret
+            type: string
+          - name: local-cluster-access-secret
+            type: string
+        volumes:
+          - name: remote-credentials
+            secret:
+              secretName: $(params.remote-cluster-access-secret)
+          - name: local-credentials
+            secret:
+              secretName: $(params.local-cluster-access-secret)
+          - name: coverage-data
+            emptyDir: {}
+        steps:
+          - name: run-e2e-test
+            image: registry.access.redhat.com/ubi9/go-toolset:9.8-1783628461
+            env:
+              - name: REPO
+                value: $(params.git-repo)
+              - name: REVISION
+                value: $(params.git-revision)
+              - name: LOCAL_KUBECONFIG
+                value: '/local-credentials/kubeconfig'
+              - name: REMOTE_KUBECONFIG
+                value: '/remote-credentials/kubeconfig'
+            volumeMounts:
+              - name: local-credentials
+                mountPath: /local-credentials
+              - name: remote-credentials
+                mountPath: /remote-credentials
+              - name: coverage-data
+                mountPath: /coverage-data
+            script: |
+              #!/usr/bin/env bash
+              set -ex
+
+              RESOURCES=integration-tests/pipelines/simple-e2e-cr
+              
+              # Install kubectl into the image and make it executable
+              curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+              chmod +x kubectl
+              export PATH=$PATH:$HOME
+
+              # Clone repo and checkout revision
+              git clone "$REPO" repo
+              cd repo || exit 1
+              git reset --hard "$REVISION"
+
+              # Install CRDs on both clusters
+              KUBECONFIG=$LOCAL_KUBECONFIG make install
+              KUBECONFIG=$REMOTE_KUBECONFIG make install
+
+              # Build the manager binary with coverage instrumentation
+              ENABLE_COVERAGE=true make build
+
+              # Install Tekton on the local cluster and wait for the cluster resolver to be ready
+              KUBECONFIG=$LOCAL_KUBECONFIG kubectl apply --filename \
+                  https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+              KUBECONFIG=$LOCAL_KUBECONFIG kubectl wait deployment/tekton-pipelines-remote-resolvers \
+                  -n tekton-pipelines-resolvers \
+                  --for=condition=Available \
+                  --timeout=120s
+
+              # Install Tekton on the remote cluster and wait for the cluster resolver to be ready
+              KUBECONFIG=$REMOTE_KUBECONFIG kubectl apply --filename \
+                  https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+              KUBECONFIG=$REMOTE_KUBECONFIG kubectl wait deployment/tekton-pipelines-remote-resolvers \
+                  -n tekton-pipelines-resolvers \
+                  --for=condition=Available \
+                  --timeout=120s
+
+              # Create the InternalServicesConfig and sample Pipeline on the local cluster
+              KUBECONFIG=$LOCAL_KUBECONFIG kubectl create \
+                  -f "$RESOURCES/internal-services-config.yaml" \
+                  -f "$RESOURCES/sample-pipeline.yaml"
+
+              # Start the operator in the background with coverage instrumentation
+              OPERATOR_LOG=$(mktemp)
+              mkdir -p /coverage-data/raw
+              KUBECONFIG=$LOCAL_KUBECONFIG GOCOVERDIR=/coverage-data/raw \
+                  ./bin/manager --remote-cluster-config-file="$REMOTE_KUBECONFIG" > "$OPERATOR_LOG" 2>&1 &
+              MANAGER_PID=$!
+
+              # Wait for the operator to be ready before creating the InternalRequest
+              for _ in $(seq 1 60); do
+                  if curl -sf http://localhost:8081/readyz > /dev/null 2>&1; then
+                      break
+                  fi
+                  sleep 2
+              done
+              if ! curl -sf http://localhost:8081/readyz > /dev/null 2>&1; then
+                  echo "Operator failed to become ready within 120s"
+                  echo "Operator logs:"
+                  cat "$OPERATOR_LOG"
+                  exit 1
+              fi
+
+              # Create the InternalRequest on the remote cluster and poll for success
+              KUBECONFIG=$REMOTE_KUBECONFIG kubectl create -f "$RESOURCES/internal-request.yaml"
+
+              TEST_RESULT=1
+              for _ in $(seq 1 60); do
+                  REASON=$(KUBECONFIG=$REMOTE_KUBECONFIG kubectl get internalrequest myrequest \
+                      -n default -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null || true)
+                  if [ "$REASON" = "Succeeded" ]; then
+                      TEST_RESULT=0
+                      break
+                  fi
+                  echo "InternalRequest not yet marked as Succeeded. Printing current CR for debugging:"
+                  KUBECONFIG=$REMOTE_KUBECONFIG kubectl get internalrequest myrequest -n default -o yaml || true
+                  sleep 5
+              done
+
+              # Stop the operator and collect coverage
+              kill "$MANAGER_PID" || true
+              wait "$MANAGER_PID" 2>/dev/null || true
+
+              echo "Operator logs:"
+              cat "$OPERATOR_LOG"
+
+              # Convert binary coverage data to text format
+              if [ -d /coverage-data/raw ] && [ "$(ls -A /coverage-data/raw 2>/dev/null)" ]; then
+                  go tool covdata textfmt -i=/coverage-data/raw -o /coverage-data/coverage.out
+                  echo "Coverage data written to /coverage-data/coverage.out"
+              else
+                  echo "No coverage data collected"
+              fi
+
+              exit $TEST_RESULT
+          - name: upload-coverage
+            image: quay.io/konflux-ci/konflux-devprod/coverport-cli
+            env:
+              - name: CODECOV_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: internal-services-coverport-secrets
+                    key: codecov-token
+              - name: COMMIT_SHA
+                value: $(params.git-revision)
+              - name: REPO_SLUG
+                value: $(params.git-org)/$(params.git-repo-name)
+              - name: REPO
+                value: $(params.git-repo)
+              - name: REVISION
+                value: $(params.git-revision)
+            volumeMounts:
+              - name: coverage-data
+                mountPath: /coverage-data
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              if [ ! -f /coverage-data/coverage.out ]; then
+                  echo "No coverage data found, skipping upload"
+                  exit 0
+              fi
+              git clone "$REPO" repo
+              cd repo
+              git reset --hard "$REVISION"
+
+              echo "Uploading e2e coverage to Codecov..."
+              curl -Os https://cli.codecov.io/v11.2.8/linux/codecov
+              chmod +x codecov
+              ./codecov upload-process \
+                --token "${CODECOV_TOKEN}" \
+                --commit-sha "${COMMIT_SHA}" \
+                --git-service github \
+                --slug "${REPO_SLUG}" \
+                --flag e2e-tests \
+                --file /coverage-data/coverage.out \
+                --disable-search
+  finally:
+    - name: deprovision-local-kind-cluster
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/mapt-oci/kind-aws-spot/deprovision/0.1/kind-aws-deprovision.yaml
+      params:
+        - name: secret-aws-credentials
+          value: mapt-kind-secret
+        - name: id
+          value: $(context.pipelineRun.name)-local
+        - name: cluster-access-secret
+          value: kfg-$(context.pipelineRun.name)-local
+        - name: oci-container
+          value: $(params.oci-container-repo):$(context.pipelineRun.name)-local
+        - name: oci-credentials
+          value: konflux-test-infra
+    - name: deprovision-remote-kind-cluster
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/mapt-oci/kind-aws-spot/deprovision/0.1/kind-aws-deprovision.yaml
+      params:
+        - name: secret-aws-credentials
+          value: mapt-kind-secret
+        - name: id
+          value: $(context.pipelineRun.name)-remote
+        - name: cluster-access-secret
+          value: kfg-$(context.pipelineRun.name)-remote
+        - name: oci-container
+          value: $(params.oci-container-repo):$(context.pipelineRun.name)-remote
+        - name: oci-credentials
+          value: konflux-test-infra
+    - name: pull-request-status-message
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog.git
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/pull-request-comment/0.1/pull-request-comment.yaml
+      params:
+        - name: test-name
+          value: "$(context.pipelineRun.name)"
+        - name: oci-container
+          value: "$(params.oci-container-repo):$(context.pipelineRun.name)-local"
+        - name: pipeline-aggregate-status
+          value: "$(tasks.status)"
+        - name: pull-request-author
+          value: "$(tasks.test-metadata.results.pull-request-author)"
+        - name: pull-request-number
+          value: "$(tasks.test-metadata.results.pull-request-number)"
+        - name: git-repo
+          value: "$(tasks.test-metadata.results.git-repo)"
+        - name: git-org
+          value: "$(tasks.test-metadata.results.git-org)"
+        - name: git-revision
+          value: "$(tasks.test-metadata.results.git-revision)"
+        - name: junit-report-name
+          value: e2e-report.xml
+        - name: e2e-log-name
+          value: e2e-tests.log
+        - name: cluster-provision-log-name
+          value: cluster-provision.log
+        - name: enable-test-results-analysis
+          value: "true"
+        - name: artifact-browser-url
+          value: $(params.artifact-browser-url)
+    - name: store-pipeline-status
+      when:
+        - input: "$(tasks.check-if-test-relevant.results.testRelevant)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/tekton-integration-catalog.git
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/store-pipeline-status/0.1/store-pipeline-status.yaml
+      params:
+        - name: oci-ref
+          value: "$(params.oci-container-repo):$(context.pipelineRun.name)-local"
+        - name: credentials-secret-name
+          value: "$(params.konflux-test-infra-secret)"
+        - name: pipelinerun-name
+          value: $(context.pipelineRun.name)
+        - name: pipeline-aggregate-status
+          value: $(tasks.status)

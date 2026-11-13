@@ -1,0 +1,209 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-collectors
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to run the collectors defined in a resource passed as parameter. The results are saved in the
+    resultsDir, one file per collector.
+
+    Template variables in collector params are interpolated using Release CR data before execution.
+    Syntax: {{ path.to.value }} e.g. {{ spec.data.releaseNotes.product_version }}
+    This enables dynamic JQL queries without modifying ReleasePlan for each release (KONFLUX-11658).
+  params:
+    - name: collectorsPath
+      type: string
+      description: Path to the JSON string of the resource containing the collectors in the data workspace
+    - name: collectorsResourceType
+      description: The type of resource that contains the collectors
+      type: string
+    - name: resultsDir
+      type: string
+      description: The relative path in the workspace to save the collector results to
+    - name: collectorsRepository
+      type: string
+      description: Git repository where the collectors will be defined
+    - name: collectorsRepositoryRevision
+      type: string
+      default: main
+      description: Git repository revision
+    - name: releasePath
+      type: string
+      description:  >-
+        Path to the json data file of the current in-progress Release
+    - name: previousReleasePath
+      type: string
+      description:  >-
+        Path to the json data file of the previous successful Release prior to the current one
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+    - name: roxConfigDir
+      type: string
+      description: The relative path in the workspace to the roxctl configuration directory (optional)
+      default: ""
+    - name: roxCentralEndpoint
+      type: string
+      description: The url for RHACS Central (optional, required for cve or fixed-cve collector)
+      default: https://acs-d4dgfbkto15c73biblcg.acs.rhcloud.com
+  workspaces:
+    - name: data
+      description: Workspace where the CRs are stored
+  volumes:
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+  steps:
+    - name: run-collectors
+      image: quay.io/konflux-ci/release-service-utils@sha256:6d4dee971855fe55724c16b049e21a396287b53766ffd3fa984ee91895e9f099
+      script: |
+        #!/usr/bin/env bash
+        set -xeo pipefail
+
+        DEFAULT_TIMEOUT=900
+        COLLECTORS_REPOSITORY="$(params.collectorsRepository)"
+        COLLECTORS_REPOSITORY_REVISION="$(params.collectorsRepositoryRevision)"
+        COLLECTORS_FILE="$(workspaces.data.path)/$(params.collectorsPath)"
+        COLLECTORS_RESOURCE_TYPE="$(params.collectorsResourceType)"
+        RESULTS_DIR="$(workspaces.data.path)/$(params.resultsDir)"
+        CONCURRENT_LIMIT=4
+        RELEASE_FILE="$(workspaces.data.path)/$(params.releasePath)"
+        PREVIOUS_RELEASE_FILE="$(workspaces.data.path)/$(params.previousReleasePath)"
+
+        # Set ROX_CONFIG_DIR and ROX_ENDPOINT if provided (for cve or fixed-cve collector)
+        ROX_CONFIG_DIR_PARAM="$(params.roxConfigDir)"
+        if [ -n "${ROX_CONFIG_DIR_PARAM}" ]; then
+          ROX_CONFIG_DIR="$(workspaces.data.path)/${ROX_CONFIG_DIR_PARAM}"
+          export ROX_CONFIG_DIR
+          echo "ROX_CONFIG_DIR set to: ${ROX_CONFIG_DIR}"
+        fi
+
+        ROX_ENDPOINT_PARAM="$(params.roxCentralEndpoint)"
+        if [ -n "${ROX_ENDPOINT_PARAM}" ]; then
+          export ROX_ENDPOINT="${ROX_ENDPOINT_PARAM}"
+          echo "ROX_ENDPOINT set to: ${ROX_ENDPOINT}"
+        fi
+
+        # Interpolate template variables in a string using Release CR data
+        # Syntax: {{ path.to.value }} e.g. {{ spec.data.releaseNotes.product_version }}
+        # Fails if a referenced path does not exist in the Release CR
+        interpolate_value() {
+            local value="$1"
+            local release_file="$2"
+
+            # If no template syntax found, return original value
+            if ! grep -qE '\{\{.*\}\}' <<< "$value"; then
+                echo "$value"
+                return 0
+            fi
+
+            local result="$value"
+            # Extract all {{ path }} patterns and replace them
+            while [[ "$result" =~ \{\{[[:space:]]*([^}]+)[[:space:]]*\}\} ]]; do
+                local full_match="${BASH_REMATCH[0]}"
+                local path="${BASH_REMATCH[1]}"
+                # Trim whitespace from path
+                path="$(echo "$path" | xargs)"
+                # Convert dot notation to jq path: spec.data.version -> .spec.data.version
+                local jq_path=".${path}"
+
+                # Get value from Release CR
+                local replacement
+                replacement="$(jq -r "${jq_path} // empty" "$release_file")"
+
+                if [ -z "$replacement" ]; then
+                    echo "Error: Template variable '${path}' not found in Release CR" >&2
+                    echo "Ensure the Release CR contains the required data at: ${path}" >&2
+                    return 1
+                fi
+
+                # Replace the template with the value
+                result="${result//$full_match/$replacement}"
+            done
+
+            echo "$result"
+        }
+
+        execute_collector() { # Expected arguments are [collector json, type of collector]
+            collector="$1"
+            collector_type="$2"
+            name="$(jq -r '.name' <<< "$collector")"
+            type="$(jq -r '.type' <<< "$collector")"
+            TIMEOUT="$(jq -r --arg default "$DEFAULT_TIMEOUT" '.timeout // $default' <<< "$collector")"
+            ARGS=()
+            NUM_ARGS="$(jq '.params | length' <<< "$collector")"
+            for ((j = 0; j < NUM_ARGS; j++)) ; do
+                param="$(jq -c --argjson j "$j" '.params[$j]' <<< "$collector")"
+                arg_name="$(jq -r '.name' <<< "$param")"
+                arg_value="$(jq -r '.value' <<< "$param")"
+                # Interpolate template variables from Release CR (KONFLUX-11658)
+                arg_value="$(interpolate_value "$arg_value" "$RELEASE_FILE")" || exit 1
+                ARGS=("${ARGS[@]}" --"${arg_name}" "${arg_value}")
+            done
+            # add the current release json path as an arg
+            ARGS=("${ARGS[@]}" --release "${RELEASE_FILE}")
+            # add the previous release json path as an arg
+            ARGS=("${ARGS[@]}" --previousRelease "${PREVIOUS_RELEASE_FILE}")
+            # Execute collector
+            timeout "$TIMEOUT" python3 "lib/${type}.py" "${ARGS[@]}" "${collector_type}" | tee \
+              "$RESULTS_DIR"/"$2"-"$name".json
+        }
+
+        if [ ! -d "${RESULTS_DIR}" ] ; then
+            echo The passed results directory does not exist. Failing as there is nowhere to save the results to
+            exit 1
+        fi
+
+        cd /tmp
+
+        git clone "${COLLECTORS_REPOSITORY}" --branch "${COLLECTORS_REPOSITORY_REVISION}" collectors
+        pushd collectors
+
+        # Set COLLECTOR_TYPE based on the value of COLLECTORS_RESOURCE_TYPE
+        if [[ "$COLLECTORS_RESOURCE_TYPE" == "releaseplan" ]]; then
+          COLLECTOR_TYPE="tenant"
+        elif [[ "$COLLECTORS_RESOURCE_TYPE" == "releaseplanadmission" ]]; then
+          COLLECTOR_TYPE="managed"
+        else
+          echo "Error: Invalid COLLECTORS_RESOURCE_TYPE. Expected 'releaseplan' or 'releaseplanadmission'." >&2
+          exit 1
+        fi
+
+        RUNNING_JOBS="\j" # Bash parameter for number of jobs currently running
+
+        if [ ! -f "${COLLECTORS_FILE}" ] ; then
+            echo "No valid file was found so no collectors will be run."
+        else
+            NUM_COLLECTORS="$(jq '.spec.collectors.items | length' "${COLLECTORS_FILE}")"
+            for ((i = 0; i < NUM_COLLECTORS; i++)) ; do
+                collector="$(jq -c --argjson i "$i" '.spec.collectors.items[$i]' "${COLLECTORS_FILE}")"
+                # Limit batch size to concurrent limit
+                while (( ${RUNNING_JOBS@P} >= "$CONCURRENT_LIMIT" )); do
+                    wait -n
+                done
+                execute_collector "$collector" "${COLLECTOR_TYPE}" &
+            done
+        fi
+
+        # Wait for remaining processes to finish
+        while (( ${RUNNING_JOBS@P} > 0 )); do
+            wait -n
+        done
