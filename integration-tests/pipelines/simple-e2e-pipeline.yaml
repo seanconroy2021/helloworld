@@ -84,7 +84,7 @@ spec:
             type: string
         steps:
           - name: check-if-test-relevant
-            image: quay.io/konflux-ci/release-service-utils@sha256:14cc7c9550cf0cecf0ba675e6ac827994f183391b94cba5a1c9a63dce5ef4f67
+            image: quay.io/konflux-ci/release-service-utils@sha256:cfcdfffd257940b31855f5298ed211d7932bf8feb6b1a4b26f59d076a0c8e758
             env:
               - name: SNAPSHOT
                 value: $(params.SNAPSHOT)
