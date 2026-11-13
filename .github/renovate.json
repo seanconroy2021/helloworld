@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>seanconroy2021/release-service-automations//mintMaker/default.json#update-mintmaker"
+    "github>seanconroy2021/release-service-automations//mintMaker/catalog.json#main"
   ]
 }

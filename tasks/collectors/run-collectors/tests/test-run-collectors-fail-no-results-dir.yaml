@@ -1,0 +1,32 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-run-collectors-fail-no-results-dir
+  annotations:
+    test/assert-task-failure: "run-task"
+spec:
+  description: |
+    Run the collectors task with no directory present as the passed resultsDir. The task should fail
+  workspaces:
+    - name: tests-workspace
+  tasks:
+    - name: run-task
+      taskRef:
+        name: run-collectors
+      params:
+        - name: collectorsPath
+          value: test_release_plan.json
+        - name: collectorsRepository
+          value: test_repo
+        - name: collectorsResourceType
+          value: releaseplan
+        - name: resultsDir
+          value: results
+        - name: releasePath
+          value: release.json
+        - name: previousReleasePath
+          value: previous_release.json
+      workspaces:
+        - name: data
+          workspace: tests-workspace

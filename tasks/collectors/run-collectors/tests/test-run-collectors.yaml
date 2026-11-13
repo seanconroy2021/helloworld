@@ -1,0 +1,112 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-run-collectors
+spec:
+  description: |
+    Run the collectors task with a given existent resource
+  workspaces:
+    - name: tests-workspace
+  tasks:
+    - name: setup
+      taskSpec:
+        steps:
+          - name: create-crs
+            image: quay.io/konflux-ci/release-service-utils@sha256:6d4dee971855fe55724c16b049e21a396287b53766ffd3fa984ee91895e9f099
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              mkdir "$(workspaces.data.path)"/results
+
+              cat > "$(workspaces.data.path)"/test_release_plan.json << EOF
+              {
+                "apiVersion": "appstudio.redhat.com/v1alpha1",
+                "kind": "ReleasePlan",
+                "metadata": {
+                  "name": "test-rp",
+                  "namespace": "default"
+                },
+                "spec": {
+                  "application": "app",
+                  "collectors": {
+                    "items": [
+                      {
+                        "name": "test-collector",
+                        "type": "dummy-collector",
+                        "timeout": 600,
+                        "params": [
+                          {
+                            "name": "test-arg",
+                            "value": "test-value"
+                          }
+                        ]
+                      }
+                    ],
+                    "target": "managed"
+                  }
+                }
+              }
+              EOF
+
+              cat > "$(workspaces.data.path)"/previous_release.json << EOF
+              {}
+              EOF
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+    - name: run-task
+      taskRef:
+        name: run-collectors
+      params:
+        - name: collectorsPath
+          value: test_release_plan.json
+        - name: collectorsRepository
+          value: test_repo
+        - name: collectorsResourceType
+          value: releaseplan
+        - name: resultsDir
+          value: results
+        - name: releasePath
+          value: release.json
+        - name: previousReleasePath
+          value: previous_release.json
+      runAfter:
+        - setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+    - name: check-result
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      runAfter:
+        - run-task
+      taskSpec:
+        workspaces:
+          - name: data
+        steps:
+          - name: check-result
+            image: quay.io/konflux-ci/release-service-utils@sha256:6d4dee971855fe55724c16b049e21a396287b53766ffd3fa984ee91895e9f099
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              if [ "$(find "$(workspaces.data.path)/results" -type f | wc -l)" -ne 1 ] ; then
+                  echo "A single collector file should exist, but that is not the case. Collector files:"
+                  ls "$(workspaces.data.path)/results"
+                  exit 1
+              fi
+
+              if ! grep 600 "$(workspaces.data.path)/mock_timeout.txt" ; then
+                echo "ERROR: the tenant collector should have been called with a 600 second timeout, but it was not"
+                exit 1
+              fi
+
+              if [ "$(jq -r '."example-argument"' "$(workspaces.data.path)/results/tenant-test-collector.json")" \
+                != "test-value" ]; then
+                echo "ERROR: collector output was not written properly. Output was:"
+                cat "$(workspaces.data.path)/results/tenant-test-collector.json"
+                exit 1
+              fi
